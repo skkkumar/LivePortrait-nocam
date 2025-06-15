@@ -7,9 +7,17 @@ Pipeline of LivePortrait (Human)
 import torch
 torch.backends.cudnn.benchmark = True # disable CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR warning
 
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
-import numpy as np
+import cv2
+# Force OpenCV to use headless mode to avoid Qt/X11 issues
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'  # Force Qt to use offscreen platform
+# Disable OpenCV GUI functionality
+os.environ['OPENCV_IO_ENABLE_JASPER'] = '0'
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
+
+import numpy as np
 import os.path as osp
 from rich.progress import track
 
@@ -516,3 +524,448 @@ class LivePortraitPipeline(object):
             log(f'Animated image with concat: {wfp_concat}')
 
         return wfp, wfp_concat
+
+    @torch.no_grad()
+    def execute_realtime(self, source_path: str, driving_frame: np.ndarray):
+        """Execute real-time inference with webcam input
+        
+        Args:
+            source_path: Path to source image
+            driving_frame: RGB frame from webcam (256x256)
+            
+        Returns:
+            Generated frame in RGB format
+        """
+        # for convenience
+        inf_cfg = self.live_portrait_wrapper.inference_cfg
+        device = self.live_portrait_wrapper.device
+        crop_cfg = self.cropper.crop_cfg
+        
+        # Process source image
+        img_rgb = load_image_rgb(source_path)
+        img_rgb = resize_to_limit(img_rgb, inf_cfg.source_max_dim, inf_cfg.source_division)
+        
+        # Crop source image
+        if inf_cfg.flag_do_crop:
+            crop_info = self.cropper.crop_source_image(img_rgb, crop_cfg)
+            if crop_info is None:
+                raise Exception("No face detected in the source image!")
+            source_lmk = crop_info['lmk_crop']
+            img_crop_256x256 = crop_info['img_crop_256x256']
+        else:
+            source_lmk = self.cropper.calc_lmk_from_cropped_image(img_rgb)
+            img_crop_256x256 = cv2.resize(img_rgb, (256, 256))  # force to resize to 256x256
+            
+        I_s = self.live_portrait_wrapper.prepare_source(img_crop_256x256)
+        x_s_info = self.live_portrait_wrapper.get_kp_info(I_s)
+        x_c_s = x_s_info['kp']
+        R_s = get_rotation_matrix(x_s_info['pitch'], x_s_info['yaw'], x_s_info['roll'])
+        f_s = self.live_portrait_wrapper.extract_feature_3d(I_s)
+        x_s = self.live_portrait_wrapper.transform_keypoint(x_s_info)
+
+        # let lip-open scalar to be 0 at first
+        flag_normalize_lip = inf_cfg.flag_normalize_lip
+        lip_delta_before_animation = None
+        if flag_normalize_lip and inf_cfg.flag_relative_motion and source_lmk is not None:
+            c_d_lip_before_animation = [0.]
+            combined_lip_ratio_tensor_before_animation = self.live_portrait_wrapper.calc_combined_lip_ratio(c_d_lip_before_animation, source_lmk)
+            if combined_lip_ratio_tensor_before_animation[0][0] >= inf_cfg.lip_normalize_threshold:
+                lip_delta_before_animation = self.live_portrait_wrapper.retarget_lip(x_s, combined_lip_ratio_tensor_before_animation)
+
+        # Process driving frame - crop it first
+        if inf_cfg.flag_crop_driving_video or (not is_square_video(None)):  # Always crop for realtime
+            ret_d = self.cropper.crop_driving_video([driving_frame])
+            if len(ret_d["frame_crop_lst"]) > 0:
+                driving_rgb_crop, driving_lmk_crop = ret_d['frame_crop_lst'][0], ret_d['lmk_crop_lst'][0]
+                driving_rgb_crop_256x256 = cv2.resize(driving_rgb_crop, (256, 256))
+            else:
+                # No face detected in driving frame
+                return None
+        else:
+            driving_lmk_crop = self.cropper.calc_lmk_from_cropped_image(driving_frame)
+            if driving_lmk_crop is None:
+                # No face detected in driving frame
+                return None
+            driving_rgb_crop_256x256 = cv2.resize(driving_frame, (256, 256))
+
+        # Additional check for valid landmarks
+        if driving_lmk_crop is None or len(driving_lmk_crop) == 0:
+            return None
+
+        # Get driving keypoints
+        I_d = self.live_portrait_wrapper.prepare_source(driving_rgb_crop_256x256)
+        x_d_info = self.live_portrait_wrapper.get_kp_info(I_d)
+        x_d = self.live_portrait_wrapper.transform_keypoint(x_d_info)
+        R_d = get_rotation_matrix(x_d_info['pitch'], x_d_info['yaw'], x_d_info['roll'])
+
+        # Calculate c_d_eyes and c_d_lip for retargeting
+        c_d_eyes, c_d_lip = self.live_portrait_wrapper.calc_ratio([driving_lmk_crop])
+        c_d_eyes_i = c_d_eyes[0]
+        c_d_lip_i = c_d_lip[0]
+
+        # Animation logic similar to execute method
+        delta_new = x_s_info['exp'].clone()
+        
+        if inf_cfg.flag_relative_motion:
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                # For relative motion in real-time, use driving rotation directly for better head tracking
+                R_new = R_d
+            else:
+                R_new = R_s
+                
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "exp":
+                # For real-time, use source expression as neutral baseline to prevent always open mouth
+                delta_new = x_s_info['exp'] + (x_d_info['exp'] - x_s_info['exp'])
+            elif inf_cfg.animation_region == "lip":
+                for lip_idx in [6, 12, 14, 17, 19, 20]:
+                    delta_new[:, lip_idx, :] = x_s_info['exp'][:, lip_idx, :] + (x_d_info['exp'][:, lip_idx, :] - x_s_info['exp'][:, lip_idx, :])
+            elif inf_cfg.animation_region == "eyes":
+                for eyes_idx in [11, 13, 15, 16, 18]:
+                    delta_new[:, eyes_idx, :] = x_s_info['exp'][:, eyes_idx, :] + (x_d_info['exp'][:, eyes_idx, :] - x_s_info['exp'][:, eyes_idx, :])
+                    
+            scale_new = x_s_info['scale']
+            t_new = x_s_info['t']
+        else:
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                R_new = R_d
+            else:
+                R_new = R_s
+                
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "exp":
+                for idx in [1,2,6,11,12,13,14,15,16,17,18,19,20]:
+                    delta_new[:, idx, :] = x_d_info['exp'][:, idx, :]
+                delta_new[:, 3:5, 1] = x_d_info['exp'][:, 3:5, 1]
+                delta_new[:, 5, 2] = x_d_info['exp'][:, 5, 2]
+                delta_new[:, 8, 2] = x_d_info['exp'][:, 8, 2]
+                delta_new[:, 9, 1:] = x_d_info['exp'][:, 9, 1:]
+            elif inf_cfg.animation_region == "lip":
+                for lip_idx in [6, 12, 14, 17, 19, 20]:
+                    delta_new[:, lip_idx, :] = x_d_info['exp'][:, lip_idx, :]
+            elif inf_cfg.animation_region == "eyes":
+                for eyes_idx in [11, 13, 15, 16, 18]:
+                    delta_new[:, eyes_idx, :] = x_d_info['exp'][:, eyes_idx, :]
+                    
+            scale_new = x_s_info['scale']
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                t_new = x_d_info['t']
+            else:
+                t_new = x_s_info['t']
+
+        t_new[..., 2].fill_(0)  # zero tz
+        x_d_i_new = scale_new * (x_c_s @ R_new + delta_new) + t_new
+
+        # Algorithm 1: Handle stitching and retargeting
+        if not inf_cfg.flag_stitching and not inf_cfg.flag_eye_retargeting and not inf_cfg.flag_lip_retargeting:
+            # without stitching or retargeting
+            if flag_normalize_lip and lip_delta_before_animation is not None:
+                x_d_i_new += lip_delta_before_animation
+        elif inf_cfg.flag_stitching and not inf_cfg.flag_eye_retargeting and not inf_cfg.flag_lip_retargeting:
+            # with stitching and without retargeting
+            if flag_normalize_lip and lip_delta_before_animation is not None:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new) + lip_delta_before_animation
+            else:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+        else:
+            eyes_delta, lip_delta = None, None
+            if inf_cfg.flag_eye_retargeting and source_lmk is not None:
+                combined_eye_ratio_tensor = self.live_portrait_wrapper.calc_combined_eye_ratio(c_d_eyes_i, source_lmk)
+                # ∆_eyes,i = R_eyes(x_s; c_s,eyes, c_d,eyes,i)
+                eyes_delta = self.live_portrait_wrapper.retarget_eye(x_s, combined_eye_ratio_tensor)
+            if inf_cfg.flag_lip_retargeting and source_lmk is not None:
+                combined_lip_ratio_tensor = self.live_portrait_wrapper.calc_combined_lip_ratio(c_d_lip_i, source_lmk)
+                # ∆_lip,i = R_lip(x_s; c_s,lip, c_d,lip,i)
+                lip_delta = self.live_portrait_wrapper.retarget_lip(x_s, combined_lip_ratio_tensor)
+
+            if inf_cfg.flag_relative_motion:  # use x_s
+                x_d_i_new = x_s + \
+                    (eyes_delta if eyes_delta is not None else 0) + \
+                    (lip_delta if lip_delta is not None else 0)
+            else:  # use x_d,i
+                x_d_i_new = x_d_i_new + \
+                    (eyes_delta if eyes_delta is not None else 0) + \
+                    (lip_delta if lip_delta is not None else 0)
+
+            if inf_cfg.flag_stitching:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+
+        # Apply driving multiplier
+        x_d_i_new = x_s + (x_d_i_new - x_s) * inf_cfg.driving_multiplier
+        
+        # Generate output
+        out = self.live_portrait_wrapper.warp_decode(f_s, x_s, x_d_i_new)
+        I_p = self.live_portrait_wrapper.parse_output(out['out'])[0]
+        
+        # Flip the output image horizontally (left to right)
+        I_p = cv2.flip(I_p, 1)
+        
+        return I_p
+
+    @torch.no_grad()
+    def execute_realtime_smooth(self, source_path: str, driving_frame: np.ndarray):
+        """Execute real-time inference with webcam input and Kalman filtering for smoothing
+        
+        Args:
+            source_path: Path to source image
+            driving_frame: RGB frame from webcam (256x256)
+            
+        Returns:
+            Generated frame in RGB format with smooth motion
+        """
+        # Initialize Kalman filter if not exists
+        if not hasattr(self, 'kalman_filters'):
+            self.kalman_filters = {}
+            self.kalman_initialized = False
+        
+        # for convenience
+        inf_cfg = self.live_portrait_wrapper.inference_cfg
+        device = self.live_portrait_wrapper.device
+        crop_cfg = self.cropper.crop_cfg
+        
+        # Process source image
+        img_rgb = load_image_rgb(source_path)
+        img_rgb = resize_to_limit(img_rgb, inf_cfg.source_max_dim, inf_cfg.source_division)
+        
+        # Crop source image
+        if inf_cfg.flag_do_crop:
+            crop_info = self.cropper.crop_source_image(img_rgb, crop_cfg)
+            if crop_info is None:
+                raise Exception("No face detected in the source image!")
+            source_lmk = crop_info['lmk_crop']
+            img_crop_256x256 = crop_info['img_crop_256x256']
+        else:
+            source_lmk = self.cropper.calc_lmk_from_cropped_image(img_rgb)
+            img_crop_256x256 = cv2.resize(img_rgb, (256, 256))  # force to resize to 256x256
+            
+        I_s = self.live_portrait_wrapper.prepare_source(img_crop_256x256)
+        x_s_info = self.live_portrait_wrapper.get_kp_info(I_s)
+        x_c_s = x_s_info['kp']
+        R_s = get_rotation_matrix(x_s_info['pitch'], x_s_info['yaw'], x_s_info['roll'])
+        f_s = self.live_portrait_wrapper.extract_feature_3d(I_s)
+        x_s = self.live_portrait_wrapper.transform_keypoint(x_s_info)
+
+        # let lip-open scalar to be 0 at first
+        flag_normalize_lip = inf_cfg.flag_normalize_lip
+        lip_delta_before_animation = None
+        if flag_normalize_lip and inf_cfg.flag_relative_motion and source_lmk is not None:
+            c_d_lip_before_animation = [0.]
+            combined_lip_ratio_tensor_before_animation = self.live_portrait_wrapper.calc_combined_lip_ratio(c_d_lip_before_animation, source_lmk)
+            if combined_lip_ratio_tensor_before_animation[0][0] >= inf_cfg.lip_normalize_threshold:
+                lip_delta_before_animation = self.live_portrait_wrapper.retarget_lip(x_s, combined_lip_ratio_tensor_before_animation)
+
+        # Process driving frame - crop it first
+        if inf_cfg.flag_crop_driving_video or (not is_square_video(None)):  # Always crop for realtime
+            ret_d = self.cropper.crop_driving_video([driving_frame])
+            if len(ret_d["frame_crop_lst"]) > 0:
+                driving_rgb_crop, driving_lmk_crop = ret_d['frame_crop_lst'][0], ret_d['lmk_crop_lst'][0]
+                driving_rgb_crop_256x256 = cv2.resize(driving_rgb_crop, (256, 256))
+            else:
+                # No face detected in driving frame
+                return None
+        else:
+            driving_lmk_crop = self.cropper.calc_lmk_from_cropped_image(driving_frame)
+            if driving_lmk_crop is None:
+                # No face detected in driving frame
+                return None
+            driving_rgb_crop_256x256 = cv2.resize(driving_frame, (256, 256))
+
+        # Additional check for valid landmarks
+        if driving_lmk_crop is None or len(driving_lmk_crop) == 0:
+            return None
+
+        # Get driving keypoints
+        I_d = self.live_portrait_wrapper.prepare_source(driving_rgb_crop_256x256)
+        x_d_info = self.live_portrait_wrapper.get_kp_info(I_d)
+        x_d = self.live_portrait_wrapper.transform_keypoint(x_d_info)
+        R_d = get_rotation_matrix(x_d_info['pitch'], x_d_info['yaw'], x_d_info['roll'])
+
+        # Apply Kalman filtering to smooth the motion
+        x_d_info_smooth = self._apply_kalman_smoothing(x_d_info, device)
+        R_d_smooth = get_rotation_matrix(x_d_info_smooth['pitch'], x_d_info_smooth['yaw'], x_d_info_smooth['roll'])
+
+        # Calculate c_d_eyes and c_d_lip for retargeting
+        c_d_eyes, c_d_lip = self.live_portrait_wrapper.calc_ratio([driving_lmk_crop])
+        c_d_eyes_i = c_d_eyes[0]
+        c_d_lip_i = c_d_lip[0]
+
+        # Animation logic similar to execute method (using smoothed values)
+        delta_new = x_s_info['exp'].clone()
+        
+        if inf_cfg.flag_relative_motion:
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                # For relative motion in real-time, use driving rotation directly for better head tracking
+                R_new = R_d_smooth
+            else:
+                R_new = R_s
+                
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "exp":
+                # For real-time, use source expression as neutral baseline to prevent always open mouth
+                delta_new = x_s_info['exp'] + (x_d_info_smooth['exp'] - x_s_info['exp'])
+            elif inf_cfg.animation_region == "lip":
+                for lip_idx in [6, 12, 14, 17, 19, 20]:
+                    delta_new[:, lip_idx, :] = x_s_info['exp'][:, lip_idx, :] + (x_d_info_smooth['exp'][:, lip_idx, :] - x_s_info['exp'][:, lip_idx, :])
+            elif inf_cfg.animation_region == "eyes":
+                for eyes_idx in [11, 13, 15, 16, 18]:
+                    delta_new[:, eyes_idx, :] = x_s_info['exp'][:, eyes_idx, :] + (x_d_info_smooth['exp'][:, eyes_idx, :] - x_s_info['exp'][:, eyes_idx, :])
+                    
+            scale_new = x_s_info['scale']
+            t_new = x_s_info['t']
+        else:
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                R_new = R_d_smooth
+            else:
+                R_new = R_s
+                
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "exp":
+                for idx in [1,2,6,11,12,13,14,15,16,17,18,19,20]:
+                    delta_new[:, idx, :] = x_d_info_smooth['exp'][:, idx, :]
+                delta_new[:, 3:5, 1] = x_d_info_smooth['exp'][:, 3:5, 1]
+                delta_new[:, 5, 2] = x_d_info_smooth['exp'][:, 5, 2]
+                delta_new[:, 8, 2] = x_d_info_smooth['exp'][:, 8, 2]
+                delta_new[:, 9, 1:] = x_d_info_smooth['exp'][:, 9, 1:]
+            elif inf_cfg.animation_region == "lip":
+                for lip_idx in [6, 12, 14, 17, 19, 20]:
+                    delta_new[:, lip_idx, :] = x_d_info_smooth['exp'][:, lip_idx, :]
+            elif inf_cfg.animation_region == "eyes":
+                for eyes_idx in [11, 13, 15, 16, 18]:
+                    delta_new[:, eyes_idx, :] = x_d_info_smooth['exp'][:, eyes_idx, :]
+                    
+            scale_new = x_s_info['scale']
+            if inf_cfg.animation_region == "all" or inf_cfg.animation_region == "pose":
+                t_new = x_d_info_smooth['t']
+            else:
+                t_new = x_s_info['t']
+
+        t_new[..., 2].fill_(0)  # zero tz
+        x_d_i_new = scale_new * (x_c_s @ R_new + delta_new) + t_new
+
+        # Algorithm 1: Handle stitching and retargeting
+        if not inf_cfg.flag_stitching and not inf_cfg.flag_eye_retargeting and not inf_cfg.flag_lip_retargeting:
+            # without stitching or retargeting
+            if flag_normalize_lip and lip_delta_before_animation is not None:
+                x_d_i_new += lip_delta_before_animation
+        elif inf_cfg.flag_stitching and not inf_cfg.flag_eye_retargeting and not inf_cfg.flag_lip_retargeting:
+            # with stitching and without retargeting
+            if flag_normalize_lip and lip_delta_before_animation is not None:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new) + lip_delta_before_animation
+            else:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+        else:
+            eyes_delta, lip_delta = None, None
+            if inf_cfg.flag_eye_retargeting and source_lmk is not None:
+                combined_eye_ratio_tensor = self.live_portrait_wrapper.calc_combined_eye_ratio(c_d_eyes_i, source_lmk)
+                # ∆_eyes,i = R_eyes(x_s; c_s,eyes, c_d,eyes,i)
+                eyes_delta = self.live_portrait_wrapper.retarget_eye(x_s, combined_eye_ratio_tensor)
+            if inf_cfg.flag_lip_retargeting and source_lmk is not None:
+                combined_lip_ratio_tensor = self.live_portrait_wrapper.calc_combined_lip_ratio(c_d_lip_i, source_lmk)
+                # ∆_lip,i = R_lip(x_s; c_s,lip, c_d,lip,i)
+                lip_delta = self.live_portrait_wrapper.retarget_lip(x_s, combined_lip_ratio_tensor)
+
+            if inf_cfg.flag_relative_motion:  # use x_s
+                x_d_i_new = x_s + \
+                    (eyes_delta if eyes_delta is not None else 0) + \
+                    (lip_delta if lip_delta is not None else 0)
+            else:  # use x_d,i
+                x_d_i_new = x_d_i_new + \
+                    (eyes_delta if eyes_delta is not None else 0) + \
+                    (lip_delta if lip_delta is not None else 0)
+
+            if inf_cfg.flag_stitching:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+
+        # Apply driving multiplier
+        x_d_i_new = x_s + (x_d_i_new - x_s) * inf_cfg.driving_multiplier
+        
+        # Generate output
+        out = self.live_portrait_wrapper.warp_decode(f_s, x_s, x_d_i_new)
+        I_p = self.live_portrait_wrapper.parse_output(out['out'])[0]
+        
+        # Flip the output image horizontally (left to right)
+        I_p = cv2.flip(I_p, 1)
+        
+        return I_p
+
+    def _apply_kalman_smoothing(self, x_d_info, device):
+        """Apply Kalman filtering to smooth motion parameters"""
+        
+        # Simple Kalman filter implementation
+        class SimpleKalmanFilter:
+            def __init__(self, initial_value, process_noise=0.01, measurement_noise=0.1):
+                self.state = initial_value
+                self.error_estimate = 1.0
+                self.process_noise = process_noise
+                self.measurement_noise = measurement_noise
+                
+            def update(self, measurement):
+                # Prediction step
+                predicted_error = self.error_estimate + self.process_noise
+                
+                # Update step
+                kalman_gain = predicted_error / (predicted_error + self.measurement_noise)
+                self.state = self.state + kalman_gain * (measurement - self.state)
+                self.error_estimate = (1 - kalman_gain) * predicted_error
+                
+                return self.state
+        
+        x_d_info_smooth = {}
+        
+        # Initialize filters if not done
+        if not self.kalman_initialized:
+            # Initialize Kalman filters for each parameter
+            self.kalman_filters['pitch'] = SimpleKalmanFilter(x_d_info['pitch'].item(), 0.005, 0.05)
+            self.kalman_filters['yaw'] = SimpleKalmanFilter(x_d_info['yaw'].item(), 0.005, 0.05)  
+            self.kalman_filters['roll'] = SimpleKalmanFilter(x_d_info['roll'].item(), 0.005, 0.05)
+            self.kalman_filters['scale'] = SimpleKalmanFilter(x_d_info['scale'].clone(), 0.001, 0.01)
+            self.kalman_filters['t'] = SimpleKalmanFilter(x_d_info['t'].clone(), 0.001, 0.01)
+            
+            # Initialize expression filters (more aggressive smoothing for stability)
+            exp_shape = x_d_info['exp'].shape
+            self.kalman_filters['exp'] = {}
+            for i in range(exp_shape[1]):  # For each keypoint
+                for j in range(exp_shape[2]):  # For each dimension (x, y, z)
+                    key = f'exp_{i}_{j}'
+                    self.kalman_filters['exp'][key] = SimpleKalmanFilter(
+                        x_d_info['exp'][0, i, j].item(), 0.002, 0.02
+                    )
+            
+            self.kalman_initialized = True
+        
+        # Apply smoothing to pose parameters
+        x_d_info_smooth['pitch'] = torch.tensor(
+            self.kalman_filters['pitch'].update(x_d_info['pitch'].item()), 
+            device=device, dtype=torch.float32
+        )
+        x_d_info_smooth['yaw'] = torch.tensor(
+            self.kalman_filters['yaw'].update(x_d_info['yaw'].item()), 
+            device=device, dtype=torch.float32
+        )
+        x_d_info_smooth['roll'] = torch.tensor(
+            self.kalman_filters['roll'].update(x_d_info['roll'].item()), 
+            device=device, dtype=torch.float32
+        )
+        
+        # Apply smoothing to scale and translation
+        scale_smooth = self.kalman_filters['scale'].state.clone()
+        for i in range(x_d_info['scale'].numel()):
+            scale_smooth.view(-1)[i] = self.kalman_filters['scale'].update(x_d_info['scale'].view(-1)[i].item())
+        x_d_info_smooth['scale'] = scale_smooth.to(device)
+        
+        t_smooth = self.kalman_filters['t'].state.clone()
+        for i in range(x_d_info['t'].numel()):
+            t_smooth.view(-1)[i] = self.kalman_filters['t'].update(x_d_info['t'].view(-1)[i].item())
+        x_d_info_smooth['t'] = t_smooth.to(device)
+        
+        # Apply smoothing to expressions
+        exp_smooth = x_d_info['exp'].clone()
+        exp_shape = x_d_info['exp'].shape
+        for i in range(exp_shape[1]):
+            for j in range(exp_shape[2]):
+                key = f'exp_{i}_{j}'
+                exp_smooth[0, i, j] = self.kalman_filters['exp'][key].update(
+                    x_d_info['exp'][0, i, j].item()
+                )
+        x_d_info_smooth['exp'] = exp_smooth
+        
+        # Copy other parameters that don't need smoothing
+        x_d_info_smooth['kp'] = x_d_info['kp']
+        
+        return x_d_info_smooth
